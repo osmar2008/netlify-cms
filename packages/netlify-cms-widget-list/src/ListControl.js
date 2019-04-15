@@ -1,28 +1,26 @@
+/** @jsx jsx */
 import React from 'react';
 import PropTypes from 'prop-types';
 import ImmutablePropTypes from 'react-immutable-proptypes';
-import styled, { cx, css } from 'react-emotion';
+import styled from '@emotion/styled';
+import { jsx, css, ClassNames } from '@emotion/core';
 import { List, Map } from 'immutable';
 import { partial } from 'lodash';
 import { SortableContainer, SortableElement, SortableHandle } from 'react-sortable-hoc';
-import { ObjectControl } from 'netlify-cms-widget-object';
+import NetlifyCmsWidgetObject from 'netlify-cms-widget-object';
 import {
   TYPES_KEY,
   getTypedFieldForValue,
   resolveFieldKeyType,
   getErrorMessageForTypedFieldAndValue,
 } from './typedListHelpers';
-import {
-  ListItemTopBar,
-  ObjectWidgetTopBar,
-  colors,
-  lengths,
-  components,
-} from 'netlify-cms-ui-default';
+import { ListItemTopBar, ObjectWidgetTopBar, colors, lengths } from 'netlify-cms-ui-default';
 
 function valueToString(value) {
   return value ? value.join(',').replace(/,([^\s]|$)/g, ', $1') : '';
 }
+
+const ObjectControl = NetlifyCmsWidgetObject.controlComponent;
 
 const ListItem = styled.div();
 
@@ -41,10 +39,16 @@ const NestedObjectLabel = styled.div`
   border-radius: 0 0 ${lengths.borderRadius} ${lengths.borderRadius};
 `;
 
-const styles = {
-  collapsedObjectControl: css`
+const styleStrings = {
+  collapsedObjectControl: `
     display: none;
   `,
+  objectWidgetTopBarContainer: `
+    padding: ${lengths.objectWidgetTopBarContainerPadding};
+  `,
+};
+
+const styles = {
   listControlItem: css`
     margin-top: 18px;
 
@@ -68,13 +72,17 @@ const valueTypes = {
 };
 
 export default class ListControl extends React.Component {
+  validations = [];
+
   static propTypes = {
     metadata: ImmutablePropTypes.map,
     onChange: PropTypes.func.isRequired,
     onChangeObject: PropTypes.func.isRequired,
+    onValidateObject: PropTypes.func.isRequired,
     value: ImmutablePropTypes.list,
     field: PropTypes.object,
     forID: PropTypes.string,
+    controlRef: PropTypes.func,
     mediaPaths: ImmutablePropTypes.map.isRequired,
     getAsset: PropTypes.func.isRequired,
     onOpenMediaLibrary: PropTypes.func.isRequired,
@@ -85,6 +93,8 @@ export default class ListControl extends React.Component {
     setInactiveStyle: PropTypes.func.isRequired,
     editorControl: PropTypes.func.isRequired,
     resolveWidget: PropTypes.func.isRequired,
+    clearFieldErrors: PropTypes.func.isRequired,
+    fieldsErrors: ImmutablePropTypes.map.isRequired,
   };
 
   static defaultProps = {
@@ -168,6 +178,17 @@ export default class ListControl extends React.Component {
     onChange((value || List()).push(parsedValue));
   };
 
+  processControlRef = ref => {
+    if (!ref) return;
+    this.validations.push(ref.validate);
+  };
+
+  validate = () => {
+    this.validations.forEach(validateListItem => {
+      validateListItem();
+    });
+  };
+
   /**
    * In case the `onChangeObject` function is frozen by a child widget implementation,
    * e.g. when debounced, always get the latest object value instead of using
@@ -184,10 +205,7 @@ export default class ListControl extends React.Component {
           ? this.getObjectValue(index).set(fieldName, newValue)
           : newValue;
       const parsedMetadata = {
-        [collectionName]: Object.assign(
-          metadata ? metadata.toJS() : {},
-          newMetadata ? newMetadata[collectionName] : {},
-        ),
+        [collectionName]: Object.assign(metadata ? metadata.toJS() : {}, newMetadata || {}),
       };
       onChange(value.set(index, newObjectValue), parsedMetadata);
     };
@@ -196,16 +214,25 @@ export default class ListControl extends React.Component {
   handleRemove = (index, event) => {
     event.preventDefault();
     const { itemsCollapsed } = this.state;
-    const { value, metadata, onChange, field } = this.props;
+    const { value, metadata, onChange, field, clearFieldErrors } = this.props;
     const collectionName = field.get('name');
     const isSingleField = this.getValueType() === valueTypes.SINGLE;
 
     const metadataRemovePath = isSingleField ? value.get(index) : value.get(index).valueSeq();
     const parsedMetadata = metadata && { [collectionName]: metadata.removeIn(metadataRemovePath) };
 
+    // Removed item object index is the last item in the list
+    const removedItemIndex = value.count() - 1;
+
     this.setState({ itemsCollapsed: itemsCollapsed.delete(index) });
 
     onChange(value.remove(index), parsedMetadata);
+    clearFieldErrors();
+
+    // Remove deleted item object validation
+    if (this.validations) {
+      this.validations.splice(removedItemIndex, 1);
+    }
   };
 
   handleItemCollapseToggle = (index, event) => {
@@ -252,8 +279,19 @@ export default class ListControl extends React.Component {
     this.setState({ itemsCollapsed: updatedItemsCollapsed });
   };
 
+  // eslint-disable-next-line react/display-name
   renderItem = (item, index) => {
-    const { classNameWrapper, editorControl, resolveWidget } = this.props;
+    const {
+      classNameWrapper,
+      editorControl,
+      onValidateObject,
+      metadata,
+      clearFieldErrors,
+      fieldsErrors,
+      controlRef,
+      resolveWidget,
+    } = this.props;
+
     const { itemsCollapsed } = this.state;
     const collapsed = itemsCollapsed.get(index);
     let field = this.props.field;
@@ -267,7 +305,7 @@ export default class ListControl extends React.Component {
 
     return (
       <SortableListItem
-        className={cx(styles.listControlItem, { [styles.listControlItemCollapsed]: collapsed })}
+        css={[styles.listControlItem, collapsed && styles.listControlItemCollapsed]}
         index={index}
         key={`item-${index}`}
       >
@@ -278,15 +316,29 @@ export default class ListControl extends React.Component {
           dragHandleHOC={SortableHandle}
         />
         <NestedObjectLabel collapsed={collapsed}>{this.objectLabel(item)}</NestedObjectLabel>
-        <ObjectControl
-          classNameWrapper={cx(classNameWrapper, { [styles.collapsedObjectControl]: collapsed })}
-          value={item}
-          field={field}
-          onChangeObject={this.handleChangeFor(index)}
-          editorControl={editorControl}
-          resolveWidget={resolveWidget}
-          forList
-        />
+        <ClassNames>
+          {({ css, cx }) => (
+            <ObjectControl
+              classNameWrapper={cx(classNameWrapper, {
+                [css`
+                  ${styleStrings.collapsedObjectControl};
+                `]: collapsed,
+              })}
+              value={item}
+              field={field}
+              onChangeObject={this.handleChangeFor(index)}
+              editorControl={editorControl}
+              resolveWidget={resolveWidget}
+              metadata={metadata}
+              forList
+              onValidateObject={onValidateObject}
+              clearFieldErrors={clearFieldErrors}
+              fieldsErrors={fieldsErrors}
+              ref={this.processControlRef}
+              controlRef={controlRef}
+            />
+          )}
+        </ClassNames>
       </SortableListItem>
     );
   };
@@ -296,7 +348,7 @@ export default class ListControl extends React.Component {
     const errorMessage = getErrorMessageForTypedFieldAndValue(field, item);
     return (
       <SortableListItem
-        className={cx(styles.listControlItem, styles.listControlItemCollapsed)}
+        css={[styles.listControlItem, styles.listControlItemCollapsed]}
         index={index}
         key={`item-${index}`}
       >
@@ -321,25 +373,37 @@ export default class ListControl extends React.Component {
     const listLabel = items.size === 1 ? labelSingular.toLowerCase() : label.toLowerCase();
 
     return (
-      <div id={forID} className={cx(classNameWrapper, components.objectWidgetTopBarContainer)}>
-        <ObjectWidgetTopBar
-          allowAdd={field.get('allow_add', true)}
-          onAdd={this.handleAdd}
-          types={field.get(TYPES_KEY, null)}
-          onAddType={type => this.handleAddType(type, resolveFieldKeyType(field))}
-          heading={`${items.size} ${listLabel}`}
-          label={labelSingular.toLowerCase()}
-          onCollapseToggle={this.handleCollapseAllToggle}
-          collapsed={itemsCollapsed.every(val => val === true)}
-        />
-        <SortableList
-          items={items}
-          renderItem={this.renderItem}
-          onSortEnd={this.onSortEnd}
-          useDragHandle
-          lockAxis="y"
-        />
-      </div>
+      <ClassNames>
+        {({ cx, css }) => (
+          <div
+            id={forID}
+            className={cx(
+              classNameWrapper,
+              css`
+                ${styleStrings.objectWidgetTopBarContainer}
+              `,
+            )}
+          >
+            <ObjectWidgetTopBar
+              allowAdd={field.get('allow_add', true)}
+              onAdd={this.handleAdd}
+              types={field.get(TYPES_KEY, null)}
+              onAddType={type => this.handleAddType(type, resolveFieldKeyType(field))}
+              heading={`${items.size} ${listLabel}`}
+              label={labelSingular.toLowerCase()}
+              onCollapseToggle={this.handleCollapseAllToggle}
+              collapsed={itemsCollapsed.every(val => val === true)}
+            />
+            <SortableList
+              items={items}
+              renderItem={this.renderItem}
+              onSortEnd={this.onSortEnd}
+              useDragHandle
+              lockAxis="y"
+            />
+          </div>
+        )}
+      </ClassNames>
     );
   }
 
